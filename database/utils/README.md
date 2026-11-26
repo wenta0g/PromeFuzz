@@ -92,3 +92,10 @@ Output includes:
 ## `cov.py` — Collect LLVM Coverage
 
 This script is functionally similar to `gcov.py`, but uses **LLVM’s `llvm-cov`** for coverage collection.
+
+Coverage data is saved to `database/<library>/latest/cov/`. Each run directory contains:
+
+- `cov-<hour>.json`: per-hour line, branch, and function totals
+- `data/<hour>.profdata`: merged profile for that hour
+- `html/index.html`: HTML report for the latest profile (`llvm-cov show -format=html`)
+- `coverage.csv`: aggregated totals across trials, also printed to the terminal

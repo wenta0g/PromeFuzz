@@ -32,6 +32,7 @@ fuzzer = "{fuzzer}"
 bin = "./{lib_name}/latest/out/fuzz_driver/aflpp_synthesized_driver"
 bin_asan = "./{lib_name}/latest/out/fuzz_driver/aflpp_synthesized_driver"
 bin_gcov = "./{lib_name}/latest/out/fuzz_driver/gcov_synthesized_driver"
+bin_cov = "./{lib_name}/latest/out/fuzz_driver/cov_synthesized_driver"
 build_gcov = "./{lib_name}/latest/build_gcov"
 out_base_path = "./{lib_name}/latest/fuzz"
 in_path = "./{lib_name}/in"
@@ -103,10 +104,15 @@ def _validate_library_structure(lib_name: str) -> bool:
 
     # Check for required binaries
     aflpp_driver = driver_dir / "aflpp_synthesized_driver"
+    cov_driver = driver_dir / "cov_synthesized_driver"
     gcov_driver = driver_dir / "gcov_synthesized_driver"
 
     if not aflpp_driver.exists():
         logger.error(f"AFL++ driver not found: {aflpp_driver}")
+        return False
+
+    if not cov_driver.exists():
+        logger.error(f"LLVM coverage driver not found: {cov_driver}")
         return False
 
     if not gcov_driver.exists():

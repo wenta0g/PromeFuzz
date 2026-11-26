@@ -4,7 +4,9 @@
 Run LLVM-Cov to get coverage information.
 """
 import os
+import csv
 import json
+import re
 import subprocess
 from pathlib import Path
 from loguru import logger
@@ -70,6 +72,45 @@ class Cov:
 
         return dict_cov
 
+    def _latest_profdata(self, data_dir: Path) -> Path | None:
+        numbered = []
+        for path in data_dir.glob("*.profdata"):
+            try:
+                numbered.append((int(path.stem), path))
+            except ValueError:
+                continue
+        if not numbered:
+            return None
+        return max(numbered)[1]
+
+    def _write_html_report(self, bin_cov: Path, data_dir: Path, html_dir: Path) -> None:
+        """Write an HTML report from the latest cumulative profdata file."""
+        profdata = self._latest_profdata(data_dir)
+        if profdata is None:
+            logger.warning(f"No profdata in {data_dir}; skipping HTML report")
+            return
+
+        if html_dir.exists():
+            shutil.rmtree(html_dir)
+
+        ignore = "|".join(re.escape(part) for part in ("/usr/include", str(bin_cov.parent)))
+        cmd = [
+            "llvm-cov",
+            "show",
+            str(bin_cov),
+            f"-instr-profile={profdata}",
+            "-format=html",
+            f"-output-dir={html_dir}",
+            "-show-directory-coverage",
+            f"-ignore-filename-regex={ignore}",
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode != 0:
+            message = result.stderr.decode(errors="replace").strip()
+            logger.error(f"llvm-cov HTML report failed: {message}")
+            return
+        logger.info(f"HTML coverage report: {html_dir / 'index.html'}")
+
     def run(
         self,
         project_name: str,
@@ -108,8 +149,10 @@ class Cov:
         workdir = (Path(project_name) / version / "cov" / out_id).resolve()
         profraw_dir = workdir / "profraw"
         data_dir = workdir / "data"
+        html_dir = workdir / "html"
         if workdir.exists():
             logger.warning(f"Already run llvm-cov for {out_id}")
+            self._write_html_report(bin_cov, data_dir, html_dir)
             return
         else:
             workdir.mkdir(parents=True, exist_ok=True)
@@ -207,6 +250,77 @@ class Cov:
             cov_path = workdir / f"cov-{_time}.json"
             cov_path.write_text(json.dumps(dict_gcov, indent=2))
 
+        self._write_html_report(bin_cov, data_dir, html_dir)
+
+
+def _final_cov_json(run_dir: Path) -> Path | None:
+    """Pick the latest per-hour summary. cov-24.json is the full campaign."""
+    candidates = []
+    for path in run_dir.glob("cov-*.json"):
+        try:
+            hour = int(path.stem.removeprefix("cov-"))
+        except ValueError:
+            continue
+        candidates.append((hour, path))
+    if not candidates:
+        return None
+    return max(candidates)[1]
+
+
+def cov_to_csv(project: str, version: str):
+    """
+    Read produced coverage JSON, write a summary CSV, and print it.
+
+    The layout matches gcov.py: one group of rows per fuzz id, with a column
+    per trial and an average. Values are covered line, branch, and function counts
+    from the latest hour of each trial.
+    """
+    cov_path = Path(project) / version / "cov"
+    csv_path = cov_path / "coverage.csv"
+    metrics = ("line", "branch", "function")
+
+    cov_data: dict[str, dict[int, dict[str, int]]] = {}
+    if cov_path.exists():
+        for run_dir in cov_path.iterdir():
+            if not run_dir.is_dir():
+                continue
+            json_file = _final_cov_json(run_dir)
+            if json_file is None:
+                continue
+            data = json.loads(json_file.read_text())
+            summary = data.get("Summary", {})
+            run_id = run_dir.name.split("_")[0]
+            run_time = int(run_dir.name.split("_")[-1])
+            cov_data.setdefault(run_id, {})[run_time] = {
+                metric: summary.get(metric, 0) for metric in metrics
+            }
+
+    with open(csv_path, "w", newline="") as csvfile:
+        csvwriter = csv.writer(csvfile)
+        for run_id, run_dict in cov_data.items():
+            run_times = sorted(run_dict.keys())
+            run_row = [run_id]
+            for time in run_times:
+                run_row.append(f"run {time}")
+            if len(run_row) < 11:
+                run_row.extend(["no run"] * (11 - len(run_row)))
+            run_row.append("average")
+            csvwriter.writerow(run_row)
+
+            for metric in metrics:
+                row = [metric]
+                total = 0
+                for time in run_times:
+                    value = run_dict[time][metric]
+                    row.append(value)
+                    total += value
+                if len(row) < 11:
+                    row.extend([" "] * (11 - len(row)))
+                row.append(total // len(run_times) if run_times else 0)
+                csvwriter.writerow(row)
+
+    logger.info(f"Coverage summary:\n{csv_path.read_text()}")
+
 
 @click.command(help="Run LLVM-Cov to get coverage information")
 @click.option(
@@ -272,6 +386,7 @@ def collect_cov(
             out_id,
             pool_size=pool_size,
         )
+    cov_to_csv(project, version)
 
 
 if __name__ == "__main__":

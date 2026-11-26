@@ -170,6 +170,13 @@ def build(lib_name: str) -> bool:
         if not _run_and_check(cmd):
             return False
 
+    cov_driver = Path("cov_synthesized_driver")
+    if not cov_driver.exists():
+        logger.error(
+            f"LLVM coverage driver was not produced for {lib_name}: {cov_driver.resolve()}"
+        )
+        return False
+
     return True
 
 

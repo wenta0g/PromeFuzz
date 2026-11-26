@@ -4,7 +4,7 @@
 Compile example fuzz drivers for fuzzing experiments.
 
 This script compiles fuzz drivers from the examples directory, including
-drivers for AFL++ and GCOV coverage analysis.
+drivers for AFL++, GCOV, and LLVM source-based coverage (llvm-cov).
 """
 from loguru import logger
 from pathlib import Path
@@ -49,11 +49,18 @@ def compile_library_examples(lib_name: str) -> bool:
 
     # Set up output directory for fuzz drivers
     fuzz_driver_dir = latest_path / "out" / "fuzz_driver"
-    if fuzz_driver_dir.exists():
+    cov_driver = fuzz_driver_dir / "cov_synthesized_driver"
+    cov_only = False
+    if fuzz_driver_dir.exists() and cov_driver.exists():
         logger.warning(
             f"Fuzz driver directory '{fuzz_driver_dir}' already exists. Skipping compilation for {lib_name}"
         )
         return True
+    if fuzz_driver_dir.exists():
+        logger.info(
+            f"Fuzz drivers for {lib_name} exist without an LLVM coverage binary. Compiling it"
+        )
+        cov_only = True
 
     try:
         fuzz_driver_dir.mkdir(parents=True, exist_ok=True)
@@ -61,11 +68,11 @@ def compile_library_examples(lib_name: str) -> bool:
         # Copy synthesized drivers
         synthesized_src = lib_example_dir / "synthesized"
         synthesized_dst = fuzz_driver_dir / "synthesized"
-        if synthesized_src.exists():
+        if synthesized_src.exists() and not synthesized_dst.exists():
             subprocess.run(
                 ["cp", "-r", str(synthesized_src), str(synthesized_dst)], check=True
             )
-        else:
+        elif not synthesized_src.exists():
             logger.warning(
                 f"Synthesized directory '{synthesized_src}' not found for {lib_name}"
             )
@@ -78,15 +85,25 @@ def compile_library_examples(lib_name: str) -> bool:
             logger.error(f"Build script '{build_script_src}' not found for {lib_name}")
             return False
 
-        # Copy and update build script paths
+        # Copy and update build script paths. The LLVM coverage compile stays.
         _copy_and_update_build_script(
             build_script_src, build_script_dst, lib_name, latest_path
         )
 
-        # Execute build script
-        subprocess.run(
-            ["bash", str(build_script_dst)], cwd=DATABASE_PATH.parent, check=True
-        )
+        if cov_only:
+            cov_cmd = _cov_compile_command(build_script_dst)
+            subprocess.run(
+                ["bash", "-c", cov_cmd], cwd=DATABASE_PATH.parent, check=True
+            )
+        else:
+            subprocess.run(
+                ["bash", str(build_script_dst)], cwd=DATABASE_PATH.parent, check=True
+            )
+
+        if not cov_driver.exists():
+            logger.error(f"LLVM coverage driver was not produced: {cov_driver}")
+            return False
+
         logger.success(f"Successfully compiled fuzz drivers for {lib_name}")
         return True
 
@@ -117,16 +134,37 @@ def _copy_and_update_build_script(
     script_content = script_content.replace(
         f"/promefuzz/database/{lib_name}/latest", str(latest_path)
     )
+    if not script_content.endswith("\n"):
+        script_content += "\n"
 
-    # Remove the last 2 lines from script_content
-    lines = script_content.splitlines()
-    if len(lines) >= 2:
-        script_content = "\n".join(lines[:-2])
-        # Add a newline at the end if the original content had one
-        if script_content and not script_content.endswith("\n"):
-            script_content += "\n"
+    if "# cov" not in script_content:
+        raise RuntimeError(
+            f"Build script '{src_script}' has no LLVM coverage section ('# cov')"
+        )
 
     dst_script.write_text(script_content)
+
+
+def _cov_compile_command(script_path: Path) -> str:
+    """Return the LLVM coverage compile commands from a build script."""
+    lines = script_path.read_text().splitlines()
+    try:
+        start = next(i for i, line in enumerate(lines) if line.strip() == "# cov")
+    except StopIteration as exc:
+        raise RuntimeError(
+            f"Build script '{script_path}' has no LLVM coverage section ('# cov')"
+        ) from exc
+
+    cov_lines = [
+        line
+        for line in lines[start + 1 :]
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not cov_lines:
+        raise RuntimeError(
+            f"Build script '{script_path}' has an empty LLVM coverage section"
+        )
+    return "\n".join(cov_lines) + "\n"
 
 
 @click.command()

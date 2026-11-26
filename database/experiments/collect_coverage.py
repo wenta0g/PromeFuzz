@@ -1,27 +1,27 @@
 #! /usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Run GCOV coverage analysis for libraries.
+Run LLVM coverage analysis for libraries.
 
-This script executes GCOV coverage collection for libraries in the database
-after fuzzing campaigns to analyze code coverage achieved.
+This script replays fuzzing campaigns with the llvm-cov instrumented driver
+and writes per-hour coverage under database/<library>/latest/cov.
 """
 from loguru import logger
 from pathlib import Path
 import subprocess
+import tomllib
 import click
 from typing import Optional
 
-from utils import get_aflpp, list_libraries
+from utils import get_aflpp, list_libraries, save_config_file
 
 
 # Global configuration
 DATABASE_PATH = Path(__file__).parent.parent.resolve()
-DEFAULT_POST_SLEEP = 30  # seconds to wait after fuzzing completion
 DEFAULT_IDENTIFICATION = "promefuzz"
 
-# TOML template for GCOV configuration
-GCOV_CONFIG_TEMPLATE = """[aflpp]
+# TOML template for coverage configuration
+COVERAGE_CONFIG_TEMPLATE = """[aflpp]
 fuzzer_path = "{afl_path}"
 timeout = "{timeout}"
 
@@ -31,6 +31,7 @@ fuzzer = "aflpp"
 bin = "./{lib_name}/latest/out/fuzz_driver/aflpp_synthesized_driver"
 bin_asan = "./{lib_name}/latest/out/fuzz_driver/aflpp_synthesized_driver"
 bin_gcov = "./{lib_name}/latest/out/fuzz_driver/gcov_synthesized_driver"
+bin_cov = "./{lib_name}/latest/out/fuzz_driver/cov_synthesized_driver"
 build_gcov = "./{lib_name}/latest/build_gcov"
 out_base_path = "./{lib_name}/latest/fuzz"
 in_path = "./{lib_name}/in"
@@ -38,45 +39,41 @@ cmd = "@@"
 """
 
 
-def run_gcov_analysis(
+def run_coverage_analysis(
     lib_name: str,
-    post_sleep: int = DEFAULT_POST_SLEEP,
+    pool_size: int = 1,
     identification: str = DEFAULT_IDENTIFICATION,
 ) -> bool:
     """
-    Run GCOV coverage analysis for a specific library.
+    Run LLVM coverage analysis for a specific library.
 
     Args:
         lib_name: Name of the library to analyze
-        post_sleep: Time to wait after fuzzing completion (seconds)
+        pool_size: Parallel seed replay workers
         identification: Identification string for the campaign
 
     Returns:
-        bool: True if GCOV analysis started successfully, False otherwise
+        bool: True if coverage analysis completed successfully, False otherwise
     """
     try:
-        # Get AFL++ path
-        aflpp_path = get_aflpp()
-
-        # Validate library structure
         if not _validate_library_structure(lib_name):
             return False
 
-        # Generate GCOV configuration
-        config_path = _generate_gcov_config(lib_name, aflpp_path, identification)
+        config_path = _generate_coverage_config(lib_name, identification)
         if not config_path:
             return False
 
-        # Execute GCOV analysis
-        return _execute_gcov_analysis(lib_name, config_path, post_sleep, identification)
+        return _execute_coverage_analysis(
+            lib_name, config_path, pool_size, identification
+        )
 
     except Exception as e:
-        logger.error(f"Failed to run GCOV analysis for {lib_name}: {e}")
+        logger.error(f"Failed to run LLVM coverage analysis for {lib_name}: {e}")
         return False
 
 
 def _validate_library_structure(lib_name: str) -> bool:
-    """Validate that the library has the required structure for GCOV analysis."""
+    """Validate that the library has the required structure for LLVM coverage."""
     path_library = DATABASE_PATH / lib_name
     latest_dir = path_library / "latest"
     driver_dir = latest_dir / "out" / "fuzz_driver"
@@ -97,69 +94,86 @@ def _validate_library_structure(lib_name: str) -> bool:
         )
         return False
 
-    # Check for required binaries
-    gcov_driver = driver_dir / "gcov_synthesized_driver"
-    build_gcov_dir = latest_dir / "build_gcov"
-
-    if not gcov_driver.exists():
-        logger.error(f"GCOV driver not found: {gcov_driver}")
+    cov_driver = driver_dir / "cov_synthesized_driver"
+    if not cov_driver.exists():
+        logger.error(f"LLVM coverage driver not found: {cov_driver}")
         return False
 
-    if not build_gcov_dir.exists():
-        logger.error(f"GCOV build directory not found: {build_gcov_dir}")
-        return False
-
-    logger.info(f"Library structure validated for GCOV analysis: {lib_name}")
+    logger.info(f"Library structure validated for LLVM coverage analysis: {lib_name}")
     return True
 
 
-def _generate_gcov_config(
-    lib_name: str, aflpp_path: Path, identification: str
-) -> Optional[Path]:
-    """Generate GCOV configuration file for the library."""
+def _cov_driver_config_path(lib_name: str) -> str:
+    return f"./{lib_name}/latest/out/fuzz_driver/cov_synthesized_driver"
+
+
+def _generate_coverage_config(lib_name: str, identification: str) -> Optional[Path]:
+    """Generate a fuzz.toml that points llvm-cov at the instrumented driver."""
     try:
         driver_dir = DATABASE_PATH / lib_name / "latest" / "out" / "fuzz_driver"
         config_path = driver_dir / "fuzz.toml"
 
-        # Check if config already exists, use it if available
         if config_path.exists():
             logger.info(f"Using existing fuzz config: {config_path}")
-            return config_path
+        else:
+            aflpp_path = get_aflpp()
+            config_content = COVERAGE_CONFIG_TEMPLATE.format(
+                afl_path=aflpp_path / "afl-fuzz",
+                lib_name=lib_name,
+                timeout=24,
+                identification=identification,
+            )
+            config_path.write_text(config_content)
+            logger.info(f"Generated coverage config: {config_path}")
 
-        # Generate new config if doesn't exist
-        config_content = GCOV_CONFIG_TEMPLATE.format(
-            afl_path=aflpp_path / "afl-fuzz",
-            lib_name=lib_name,
-            timeout=24,  # Default timeout for GCOV config
-            identification=identification,
-        )
-
-        config_path.write_text(config_content)
-        logger.info(f"Generated GCOV config: {config_path}")
+        if not _ensure_bin_cov(config_path, lib_name, identification):
+            return None
         return config_path
 
     except Exception as e:
-        logger.error(f"Failed to generate GCOV config for {lib_name}: {e}")
+        logger.error(f"Failed to generate coverage config for {lib_name}: {e}")
         return None
 
 
-def _execute_gcov_analysis(
-    lib_name: str, config_path: Path, post_sleep: int, identification: str
-) -> bool:
-    """Execute the GCOV analysis process."""
+def _ensure_bin_cov(config_path: Path, lib_name: str, identification: str) -> bool:
+    """Make sure fuzz.toml names the llvm-cov driver as bin_cov."""
+    data = tomllib.loads(config_path.read_text())
     try:
-        gcov_script = DATABASE_PATH / "utils" / "gcov.py"
+        section = data[lib_name]["latest"][identification]
+    except KeyError:
+        logger.error(
+            f"{config_path} has no [{lib_name}.latest.{identification}] section"
+        )
+        return False
 
-        if not gcov_script.exists():
-            logger.error(f"GCOV script not found: {gcov_script}")
+    expected = _cov_driver_config_path(lib_name)
+    if section.get("bin_cov"):
+        return True
+
+    section["bin_cov"] = expected
+    if not save_config_file(config_path, data):
+        return False
+    logger.info(f"Added bin_cov to {config_path}")
+    return True
+
+
+def _execute_coverage_analysis(
+    lib_name: str, config_path: Path, pool_size: int, identification: str
+) -> bool:
+    """Execute LLVM coverage collection."""
+    try:
+        cov_script = DATABASE_PATH / "utils" / "cov.py"
+
+        if not cov_script.exists():
+            logger.error(f"LLVM coverage script not found: {cov_script}")
             return False
 
-        gcov_cmd = [
-            str(gcov_script),
+        cov_cmd = [
+            str(cov_script),
             "-c",
             str(config_path),
             "-ps",
-            str(post_sleep),
+            str(pool_size),
             "-v",
             "latest",
             "-p",
@@ -169,17 +183,17 @@ def _execute_gcov_analysis(
         ]
 
         logger.info(
-            f"Starting GCOV analysis for {lib_name} with command: {' '.join(gcov_cmd)}"
+            f"Starting LLVM coverage analysis for {lib_name} with command: {' '.join(cov_cmd)}"
         )
-        subprocess.run(gcov_cmd, cwd=DATABASE_PATH, check=True)
-        logger.success(f"GCOV analysis completed successfully for {lib_name}")
+        subprocess.run(cov_cmd, cwd=DATABASE_PATH, check=True)
+        logger.success(f"LLVM coverage analysis completed successfully for {lib_name}")
         return True
 
     except subprocess.CalledProcessError as e:
-        logger.error(f"GCOV analysis process failed for {lib_name}: {e}")
+        logger.error(f"LLVM coverage analysis failed for {lib_name}: {e}")
         return False
     except Exception as e:
-        logger.error(f"Unexpected error during GCOV analysis for {lib_name}: {e}")
+        logger.error(f"Unexpected error during LLVM coverage analysis for {lib_name}: {e}")
         return False
 
 
@@ -187,10 +201,10 @@ def _execute_gcov_analysis(
 @click.argument("mode", type=click.Choice(["one", "all"]))
 @click.argument("library_name", required=False)
 @click.option(
-    "--post-sleep",
+    "--pool-size",
     "-ps",
-    default=DEFAULT_POST_SLEEP,
-    help="Time to wait after fuzzing completion (seconds)",
+    default=1,
+    help="Parallel seed replay workers for llvm-cov",
 )
 @click.option(
     "--identification",
@@ -199,10 +213,10 @@ def _execute_gcov_analysis(
     help="Campaign identification string",
 )
 def main(
-    mode: str, library_name: Optional[str], post_sleep: int, identification: str
+    mode: str, library_name: Optional[str], pool_size: int, identification: str
 ) -> None:
     """
-    Run GCOV coverage analysis for libraries.
+    Run LLVM coverage analysis for libraries.
 
     MODE: Choose 'one' to analyze a specific library or 'all' to analyze all libraries.
     LIBRARY_NAME: Required when MODE is 'one'. Specify which library to analyze.
@@ -218,9 +232,9 @@ def main(
             )
             exit(1)
 
-        success = run_gcov_analysis(library_name, post_sleep, identification)
+        success = run_coverage_analysis(library_name, pool_size, identification)
         if not success:
-            logger.error(f"Failed to run GCOV analysis for {library_name}")
+            logger.error(f"Failed to run LLVM coverage analysis for {library_name}")
             exit(1)
 
     elif mode == "all":
@@ -228,24 +242,25 @@ def main(
         successful_libraries = []
 
         for lib in list_libraries:
-            logger.info(f"Starting GCOV analysis for {lib}")
-            success = run_gcov_analysis(lib, post_sleep, identification)
+            logger.info(f"Starting LLVM coverage analysis for {lib}")
+            success = run_coverage_analysis(lib, pool_size, identification)
 
             if success:
                 successful_libraries.append(lib)
             else:
                 failed_libraries.append(lib)
 
-        # Report results
         if successful_libraries:
             logger.success(
-                f"Successfully completed GCOV analysis for: {', '.join(successful_libraries)}"
+                f"Successfully completed LLVM coverage analysis for: {', '.join(successful_libraries)}"
             )
         if failed_libraries:
-            logger.warning(f"Failed GCOV analysis for: {', '.join(failed_libraries)}")
+            logger.warning(
+                f"Failed LLVM coverage analysis for: {', '.join(failed_libraries)}"
+            )
             exit(1)
         else:
-            logger.success("All GCOV analyses completed successfully")
+            logger.success("All LLVM coverage analyses completed successfully")
 
 
 if __name__ == "__main__":

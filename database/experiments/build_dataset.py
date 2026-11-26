@@ -112,6 +112,13 @@ def _build_configurations(build_dir_path: Path, lib_name: str) -> bool:
             logger.error(f"Failed to build {lib_name} with {target}: {e}")
             return False
 
+    cov_build = build_dir_path / "build_cov"
+    if not cov_build.exists():
+        logger.error(
+            f"LLVM coverage build directory was not produced for {lib_name}: {cov_build}"
+        )
+        return False
+
     return True
 
 
